@@ -27,7 +27,6 @@ ASSIGN_KEEP_MS = 1000
 FWD_TIMEOUT_MS = 3000
 DEDUP_MS = 1000
 FLUSH_MS = 1000
-MIN_FREE_BYTES = 16 * 1024
 BEAR_MERGE_MS = 1000
 BEAR_SHOW_MS = 1000
 BEAR_KEEP_MS = 60000
@@ -39,6 +38,8 @@ SD_MISO = 9
 SD_MOSI = 10
 SD_CS = 4
 SD_FREQ = 1000000
+ERR_NODEV = 19
+ERR_NOSPC = 28
 
 MAGIC = 0x52
 T_BEACON = 0x01
@@ -90,14 +91,13 @@ def setup_espnow():
     return e
 
 
-def free_bytes():
-    st = os.statvfs(SD_MOUNT)
-    return st[0] * st[3]
-
-
 def fmt_s(ms):
     d = (abs(ms) + 50) // 100
     return '%s%d.%d' % ('-' if ms < 0 and d else '', d // 10, d % 10)
+
+
+def err_no(e):
+    return e.args[0] if e.args else None
 
 
 def log_names(n):
@@ -181,17 +181,24 @@ class Station:
         if self.sd_ok:
             try:
                 os.listdir(SD_MOUNT)
-                return True
+                return None
             except OSError:
                 self.unmount_sd()
         try:
             self.sd = machine.SDCard(slot=SD_SLOT, width=1, sck=machine.Pin(SD_SCK), miso=machine.Pin(SD_MISO), mosi=machine.Pin(SD_MOSI), cs=machine.Pin(SD_CS), freq=SD_FREQ)
-            os.mount(self.sd, SD_MOUNT)
+            self.sd.info()
         except Exception:
             self.unmount_sd()
-            return False
+            return 'LOG OFF: no SD card'
+        try:
+            os.mount(self.sd, SD_MOUNT)
+        except Exception as e:
+            self.unmount_sd()
+            if err_no(e) == ERR_NODEV:
+                return 'LOG OFF: SD not FAT32'
+            return 'LOG OFF: no SD card'
         self.sd_ok = True
-        return True
+        return None
 
     def unmount_sd(self):
         try:
@@ -212,17 +219,15 @@ class Station:
         if not hasattr(machine, 'SDCard'):
             print('LOG OFF: SDCard not supported')
             return
-        if not self.mount_sd():
-            print('LOG OFF: no SD card')
+        msg = self.mount_sd()
+        if msg:
+            print(msg)
             return
         try:
             names = os.listdir(SD_MOUNT)
             n = 0
             while [s for s in log_names(n) if s in names]:
                 n += 1
-            if free_bytes() < MIN_FREE_BYTES:
-                print('LOG OFF: low SD space')
-                return
             files = log_names(n)
             self.f = open('%s/%s' % (SD_MOUNT, files[0]), 'w')
             self.f.write('time_s,gw,' + ','.join(COLS) + ',' + ','.join(BEAR_COLS) + '\n')
@@ -232,22 +237,22 @@ class Station:
             self.f.flush()
             for g in self.raw:
                 g.flush()
-        except OSError:
-            self.log_fail()
+        except OSError as e:
+            self.log_fail(e)
             return
         self.log_t0 = t0
         self.last_flush = time.ticks_ms()
 
-    def log_fail(self):
-        print('LOG OFF: write error')
+    def log_fail(self, e):
+        print('LOG OFF: SD full' if err_no(e) == ERR_NOSPC else 'LOG OFF: write error')
         self.close_log()
         self.unmount_sd()
 
     def write(self, f, s):
         try:
             f.write(s)
-        except OSError:
-            self.log_fail()
+        except OSError as e:
+            self.log_fail(e)
 
     def flush_log(self):
         if self.f is None:
@@ -259,13 +264,8 @@ class Station:
             self.f.flush()
             for g in self.raw:
                 g.flush()
-            low = free_bytes() < MIN_FREE_BYTES
-        except OSError:
-            self.log_fail()
-            return
-        if low:
-            print('LOG OFF: low SD space')
-            self.close_log()
+        except OSError as e:
+            self.log_fail(e)
 
     def bear_fields(self):
         if not self.bear_csv:
