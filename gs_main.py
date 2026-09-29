@@ -27,6 +27,7 @@ ASSIGN_KEEP_MS = 1000
 FWD_TIMEOUT_MS = 3000
 DEDUP_MS = 1000
 FLUSH_MS = 1000
+MIN_FREE_BYTES = 16 * 1024
 BEAR_MERGE_MS = 1000
 BEAR_SHOW_MS = 1000
 BEAR_KEEP_MS = 60000
@@ -94,6 +95,11 @@ def setup_espnow():
 def fmt_s(ms):
     d = (abs(ms) + 50) // 100
     return '%s%d.%d' % ('-' if ms < 0 and d else '', d // 10, d % 10)
+
+
+def free_bytes():
+    st = os.statvfs('/')
+    return st[0] * st[3]
 
 
 def err_no(e):
@@ -216,29 +222,19 @@ class Station:
     def start_log(self, t0):
         self.close_log()
         self.bear_csv = []
-        if not hasattr(machine, 'SDCard'):
-            print('LOG OFF: SDCard not supported')
-            return
-        msg = self.mount_sd()
-        if msg:
-            print(msg)
-            return
         try:
-            names = os.listdir(SD_MOUNT)
+            names = os.listdir('/')
             n = 0
-            while [s for s in log_names(n) if s in names]:
+            while 'GS_%03d.csv' % n in names:
                 n += 1
-            files = log_names(n)
-            self.f = open('%s/%s' % (SD_MOUNT, files[0]), 'w')
+            if free_bytes() < MIN_FREE_BYTES:
+                print('LOG OFF: low flash space')
+                return
+            self.f = open('/GS_%03d.csv' % n, 'w')
             self.f.write('time_s,gw,' + ','.join(COLS) + ',' + ','.join(BEAR_COLS) + '\n')
-            for i in range(N + 1):
-                self.raw.append(open('%s/%s' % (SD_MOUNT, files[i + 1]), 'w'))
-                self.raw[i].write(','.join(RAW_COLS[i]) + '\n')
             self.f.flush()
-            for g in self.raw:
-                g.flush()
-        except OSError as e:
-            self.log_fail(e)
+        except OSError:
+            self.flash_fail()
             return
         self.log_t0 = t0
         self.last_flush = time.ticks_ms()
@@ -248,11 +244,15 @@ class Station:
         self.close_log()
         self.unmount_sd()
 
+    def flash_fail(self):
+        print('LOG OFF: write error')
+        self.close_log()
+
     def write(self, f, s):
         try:
             f.write(s)
-        except OSError as e:
-            self.log_fail(e)
+        except OSError:
+            self.flash_fail()
 
     def flush_log(self):
         if self.f is None:
@@ -262,10 +262,13 @@ class Station:
         self.last_flush = time.ticks_ms()
         try:
             self.f.flush()
-            for g in self.raw:
-                g.flush()
-        except OSError as e:
-            self.log_fail(e)
+            low = free_bytes() < MIN_FREE_BYTES
+        except OSError:
+            self.flash_fail()
+            return
+        if low:
+            print('LOG OFF: low flash space')
+            self.close_log()
 
     def bear_fields(self):
         if not self.bear_csv:
@@ -280,7 +283,7 @@ class Station:
         self.write(self.f, '%d.%d,%s,%s%s\n' % (d // 10, d % 10, NODES[sid], ','.join([str(x) for x in vals]), self.bear_fields()))
 
     def raw_row(self, idx, rssi, kind, pkt, extra, at=None):
-        if self.f is None:
+        if self.f is None or not self.raw:
             return
         if at is None:
             at = time.ticks_ms()
