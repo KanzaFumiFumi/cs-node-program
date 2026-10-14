@@ -2,6 +2,7 @@ import network
 import espnow
 import struct
 import time
+import gc
 
 NODE_ID = 'A'
 
@@ -23,6 +24,9 @@ DETECT_COUNT = 8
 CYCLE_LOST_MS = 1500
 CYCLE_SWITCH_MS = 800
 IDLE_WAIT_MS = 100
+RX_BUF = 4096
+SEND_TRIES = 3
+SEND_RETRY_MS = 2
 
 MAGIC = 0x53
 T_PRESENCE = 0x11
@@ -60,6 +64,7 @@ def setup_espnow():
     sta.config(channel=CHANNEL)
     sta.config(pm=sta.PM_NONE)
     e = espnow.ESPNow()
+    e.config(rxbuf=RX_BUF)
     e.active(True)
     if not hasattr(e, 'peers_table'):
         print('ERROR: peers_table is not supported by this firmware')
@@ -94,19 +99,22 @@ class Node:
         self.plan = []
         self.rec = [[0] * DETECT_COUNT for _ in range(M)]
 
+    def push(self, mac, pkt):
+        for k in range(SEND_TRIES):
+            try:
+                self.e.send(mac, pkt, False)
+                return
+            except OSError:
+                if k + 1 < SEND_TRIES:
+                    time.sleep_ms(SEND_RETRY_MS)
+
     def send(self, pkt):
-        try:
-            self.e.send(BCAST, pkt, False)
-        except OSError:
-            pass
+        self.push(BCAST, pkt)
         if self.gw == ME:
             self.forward(pkt)
 
     def forward(self, pkt):
-        try:
-            self.e.send(GS_MAC_B, pkt, False)
-        except OSError:
-            pass
+        self.push(GS_MAC_B, pkt)
 
     def set_gw(self, gid):
         self.assigned = True
@@ -229,6 +237,7 @@ class Node:
                 self.send(struct.pack(FMT_DETECT, MAGIC, T_DETECT, ME, self.cycle, k))
             else:
                 self.send_report()
+                gc.collect()
 
 
 def main():

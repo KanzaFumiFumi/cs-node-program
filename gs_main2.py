@@ -29,6 +29,7 @@ DEDUP_MS = 1000
 FLUSH_MS = 1000
 DETECT_WINDOW_MS = 800
 CYCLE_WAIT_MS = 1500
+WRITTEN_KEEP = 8
 
 SD_MOUNT = '/sd'
 SD_SLOT = 2
@@ -127,6 +128,10 @@ def decode(msg):
     return None, '?', None
 
 
+def cell(x):
+    return '' if x is None or x == 0 else str(x)
+
+
 def fields(kind, v):
     if kind == 'PRESENCE':
         return [str(v[3]), '', ''] + [''] * M
@@ -136,7 +141,7 @@ def fields(kind, v):
         return ['', str(v[3]), str(v[4])] + [''] * M
     if kind == 'REPORT':
         cnt = (len(v) - 4) // M
-        return ['', str(v[3]), ''] + [' '.join([str(x) for x in v[4 + p * cnt:4 + (p + 1) * cnt]]) for p in range(M)]
+        return ['', str(v[3]), ''] + [' '.join([cell(x) for x in v[4 + p * cnt:4 + (p + 1) * cnt]]) for p in range(M)]
     return [''] * (3 + M)
 
 
@@ -157,6 +162,7 @@ class Station:
         self.latest = [0] * N
         self.seen = []
         self.pending = []
+        self.written = []
         self.last_cnt = 0
         self.c0 = None
         self.f = None
@@ -296,12 +302,17 @@ class Station:
         for p in self.pending:
             if p[0] == c:
                 return p
+        if c in self.written:
+            return None
         p = [c, time.ticks_ms(), {}, 0]
         self.pending.append(p)
         return p
 
     def write_cycle(self, p):
         c, at, reps, cnt = p
+        self.written.append(c)
+        if len(self.written) > WRITTEN_KEEP:
+            self.written.pop(0)
         if cnt == 0:
             cnt = self.last_cnt
         if cnt == 0:
@@ -319,9 +330,9 @@ class Station:
                     vals.append(r[q * cnt + k] if r is not None else 0)
             if logging:
                 ms = ((c - self.c0) & 0xFFFF) * 1000 + k * slot
-                self.write(self.f, '%s,%s,%s\n' % (fmt_t(ms), gw, ','.join([str(x) for x in vals])))
+                self.write(self.f, '%s,%s,%s\n' % (fmt_t(ms), gw, ','.join([cell(x) for x in vals])))
             if not (self.measuring or self.holding):
-                print(' '.join(['%s:%d' % (COLS[i], vals[i]) for i in range(N * M)]))
+                print(' '.join(['%s:%s' % (COLS[i], cell(vals[i]) or '--') for i in range(N * M)]))
 
     def flush_cycles(self, before=None):
         now = time.ticks_ms()
@@ -335,11 +346,13 @@ class Station:
         self.pending = keep
 
     def on_cycle(self, c):
-        self.flush_cycles(c)
+        self.flush_cycles((c - 1) & 0xFFFF)
         self.find_cycle(c)
 
     def on_report(self, v):
         p = self.find_cycle(v[3])
+        if p is None:
+            return
         cnt = (len(v) - 4) // M
         if p[3] == 0:
             p[3] = cnt
