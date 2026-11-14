@@ -27,10 +27,6 @@ ASSIGN_KEEP_MS = 1000
 FWD_TIMEOUT_MS = 3000
 DEDUP_MS = 1000
 FLUSH_MS = 1000
-MIN_FREE_BYTES = 16 * 1024
-BEAR_MERGE_MS = 1000
-BEAR_SHOW_MS = 1000
-BEAR_KEEP_MS = 60000
 
 SD_MOUNT = '/sd'
 SD_SLOT = 2
@@ -47,19 +43,16 @@ T_BEACON = 0x01
 T_START = 0x02
 T_RESET = 0x03
 T_ASSIGN = 0x05
-T_BEAR = 0x06
 BCAST = b'\xff' * 6
 
 N = len(NODES)
 M = N - 1
 OTHERS = [[j for j in range(N) if j != i] for i in range(N)]
 COLS = ['%s->%s' % (NODES[i], NODES[j]) for i in range(N) for j in OTHERS[i]]
-BEAR_COLS = ['bear', 'bear_start_s', 'bear_len_s', 'bear_drop_db']
 RAW_NAMES = [c for c in NODES] + ['GS']
 RAW_HEAD = ['time_ms', 'gw', 'gs_rssi', 'type', 'len', 'hex', 'seq', 'node_ms', 'node_gw']
-RAW_TAIL = ['bear_rid', 'bear_partner', 'bear_age_ms', 'bear_len_ms', 'bear_drop_db']
-RAW_COLS = [RAW_HEAD + COLS[i * M:(i + 1) * M] + RAW_TAIL for i in range(N)] + [RAW_HEAD + ['rssi_%d' % (k + 1) for k in range(M)] + RAW_TAIL]
-EMPTY = [''] * (3 + M + len(RAW_TAIL))
+RAW_COLS = [RAW_HEAD + COLS[i * M:(i + 1) * M] for i in range(N)] + [RAW_HEAD + ['rssi_%d' % (k + 1) for k in range(M)]]
+EMPTY = [''] * (3 + M)
 MAC_OF = [bytes([int(x, 16) for x in MACS[c].split(':')]) for c in NODES]
 ID_OF = {mac: i for i, mac in enumerate(MAC_OF)}
 
@@ -67,10 +60,8 @@ FMT_BEACON = '<BBBHI%dbB' % M
 FMT_START = '<BBI'
 FMT_RESET = '<BB'
 FMT_ASSIGN = '<BBB'
-FMT_BEAR = '<BBBBBHHB'
 LEN_BEACON = struct.calcsize(FMT_BEACON)
 LEN_START = struct.calcsize(FMT_START)
-LEN_BEAR = struct.calcsize(FMT_BEAR)
 
 
 def setup_espnow():
@@ -92,16 +83,6 @@ def setup_espnow():
     return e
 
 
-def fmt_s(ms):
-    d = (abs(ms) + 50) // 100
-    return '%s%d.%d' % ('-' if ms < 0 and d else '', d // 10, d % 10)
-
-
-def free_bytes():
-    st = os.statvfs('/')
-    return st[0] * st[3]
-
-
 def err_no(e):
     return e.args[0] if e.args else None
 
@@ -116,10 +97,6 @@ def decode(msg):
         v = struct.unpack(FMT_BEACON, msg)
         if v[0] == MAGIC and v[1] == T_BEACON and v[2] < N:
             return v[2], 'BEACON', v
-    elif n == LEN_BEAR:
-        v = struct.unpack(FMT_BEAR, msg)
-        if v[0] == MAGIC and v[1] == T_BEAR and v[2] < N and v[4] < N and v[2] != v[4]:
-            return v[2], 'BEAR', v
     elif n == LEN_START:
         v = struct.unpack(FMT_START, msg)
         if v[0] == MAGIC and v[1] == T_START:
@@ -129,11 +106,9 @@ def decode(msg):
 
 def fields(kind, v):
     if kind == 'BEACON':
-        return [str(v[3]), str(v[4]), NODES[v[5 + M]] if v[5 + M] < N else '-'] + [str(x) for x in v[5:5 + M]] + [''] * len(RAW_TAIL)
+        return [str(v[3]), str(v[4]), NODES[v[5 + M]] if v[5 + M] < N else '-'] + [str(x) for x in v[5:5 + M]]
     if kind == 'START':
-        return ['', str(v[2]), ''] + [''] * (M + len(RAW_TAIL))
-    if kind == 'BEAR':
-        return [''] * (3 + M) + [str(v[3]), NODES[v[4]], str(v[5]), str(v[6]), str(v[7])]
+        return ['', str(v[2]), ''] + [''] * M
     return EMPTY
 
 
@@ -160,9 +135,6 @@ class Station:
         self.last_flush = time.ticks_ms()
         self.sd = None
         self.sd_ok = False
-        self.bear_recent = []
-        self.bear_show = []
-        self.bear_csv = []
 
     def send(self, pkt):
         try:
@@ -221,20 +193,29 @@ class Station:
 
     def start_log(self, t0):
         self.close_log()
-        self.bear_csv = []
+        if not hasattr(machine, 'SDCard'):
+            print('LOG OFF: SDCard not supported')
+            return
+        msg = self.mount_sd()
+        if msg:
+            print(msg)
+            return
         try:
-            names = os.listdir('/')
+            names = os.listdir(SD_MOUNT)
             n = 0
-            while 'GS_%03d.csv' % n in names:
+            while [s for s in log_names(n) if s in names]:
                 n += 1
-            if free_bytes() < MIN_FREE_BYTES:
-                print('LOG OFF: low flash space')
-                return
-            self.f = open('/GS_%03d.csv' % n, 'w')
-            self.f.write('time_s,gw,' + ','.join(COLS) + ',' + ','.join(BEAR_COLS) + '\n')
+            files = log_names(n)
+            self.f = open('%s/%s' % (SD_MOUNT, files[0]), 'w')
+            self.f.write('time_s,gw,' + ','.join(COLS) + '\n')
+            for i in range(N + 1):
+                self.raw.append(open('%s/%s' % (SD_MOUNT, files[i + 1]), 'w'))
+                self.raw[i].write(','.join(RAW_COLS[i]) + '\n')
             self.f.flush()
-        except OSError:
-            self.flash_fail()
+            for g in self.raw:
+                g.flush()
+        except OSError as e:
+            self.log_fail(e)
             return
         self.log_t0 = t0
         self.last_flush = time.ticks_ms()
@@ -244,15 +225,11 @@ class Station:
         self.close_log()
         self.unmount_sd()
 
-    def flash_fail(self):
-        print('LOG OFF: write error')
-        self.close_log()
-
     def write(self, f, s):
         try:
             f.write(s)
-        except OSError:
-            self.flash_fail()
+        except OSError as e:
+            self.log_fail(e)
 
     def flush_log(self):
         if self.f is None:
@@ -262,28 +239,19 @@ class Station:
         self.last_flush = time.ticks_ms()
         try:
             self.f.flush()
-            low = free_bytes() < MIN_FREE_BYTES
-        except OSError:
-            self.flash_fail()
-            return
-        if low:
-            print('LOG OFF: low flash space')
-            self.close_log()
-
-    def bear_fields(self):
-        if not self.bear_csv:
-            return ',,,,'
-        name, start, length, drop = self.bear_csv.pop(0)
-        return ',%s,%s,%s,%d' % (name, fmt_s(time.ticks_diff(start, self.log_t0)), fmt_s(length), drop)
+            for g in self.raw:
+                g.flush()
+        except OSError as e:
+            self.log_fail(e)
 
     def log_row(self, sid, vals):
         if self.f is None:
             return
         d = (time.ticks_diff(time.ticks_ms(), self.log_t0) + 50) // 100
-        self.write(self.f, '%d.%d,%s,%s%s\n' % (d // 10, d % 10, NODES[sid], ','.join([str(x) for x in vals]), self.bear_fields()))
+        self.write(self.f, '%d.%d,%s,%s\n' % (d // 10, d % 10, NODES[sid], ','.join([str(x) for x in vals])))
 
     def raw_row(self, idx, rssi, kind, pkt, extra, at=None):
-        if self.f is None or not self.raw:
+        if self.f is None:
             return
         if at is None:
             at = time.ticks_ms()
@@ -301,41 +269,6 @@ class Station:
                 pass
         self.f = None
         self.raw = []
-
-    def on_bear(self, a, b, age, length, drop):
-        if a >= N or b >= N or a == b:
-            return
-        now = time.ticks_ms()
-        start = time.ticks_add(now, -age)
-        lo = min(a, b)
-        hi = max(a, b)
-        self.bear_recent = [r for r in self.bear_recent if time.ticks_diff(now, r[2]) < BEAR_KEEP_MS]
-        for r in self.bear_recent:
-            if r[0] == lo and r[1] == hi and abs(time.ticks_diff(start, r[3])) <= BEAR_MERGE_MS:
-                return
-        self.bear_recent.append((lo, hi, now, start))
-        name = '%s-%s' % (NODES[lo], NODES[hi])
-        self.bear_show.append([name, None])
-        if self.f is not None:
-            self.bear_csv.append((name, start, length, drop))
-
-    def bear_text(self):
-        if not self.bear_show:
-            return ''
-        now = time.ticks_ms()
-        names = []
-        keep = []
-        for it in self.bear_show:
-            if it[1] is None:
-                it[1] = time.ticks_add(now, BEAR_SHOW_MS)
-            if time.ticks_diff(it[1], now) > 0:
-                keep.append(it)
-                if it[0] not in names:
-                    names.append(it[0])
-        self.bear_show = keep
-        if not names:
-            return ''
-        return ' 【熊速報】' + ' '.join([s + '区間' for s in names])
 
     def start_measure(self):
         self.measuring = True
@@ -413,9 +346,7 @@ class Station:
             self.log_row(sid, self.vals)
             if self.measuring or self.holding:
                 return
-            print(' '.join(['%s:%d' % (COLS[i], self.vals[i]) for i in range(N * M)]) + self.bear_text())
-        elif kind == 'BEAR':
-            self.on_bear(v[2], v[4], v[5], v[6], v[7])
+            print(' '.join(['%s:%d' % (COLS[i], self.vals[i]) for i in range(N * M)]))
 
     def need_assign(self):
         if self.other_fwd or self.last_fwd is None:
