@@ -15,6 +15,12 @@ MACS = {
     'D': '00:00:00:00:00:00',
 }
 
+# ---- 害獣検知の表示（ここを書き換える） ----
+# 表示する区間：12個の値の行の後ろに、この順で区間ごとの状態を付ける。
+ALERT_SECTIONS = ['A-B', 'B-C', 'C-D', 'D-A']
+# 表示時間 [ms]：その区間の通過速報を受けてから、この時間「害獣を検知」と表示する。新しい速報を受けたら、そこから数え直す。
+ALERT_MS = 5000
+
 NODES = 'ABCD'
 CHANNEL = 6
 RECV_TIMEOUT_MS = 50
@@ -43,6 +49,7 @@ T_BEACON = 0x01
 T_START = 0x02
 T_RESET = 0x03
 T_ASSIGN = 0x05
+T_PASS = 0x08
 BCAST = b'\xff' * 6
 
 N = len(NODES)
@@ -55,13 +62,16 @@ RAW_COLS = [RAW_HEAD + COLS[i * M:(i + 1) * M] for i in range(N)] + [RAW_HEAD + 
 EMPTY = [''] * (3 + M)
 MAC_OF = [bytes([int(x, 16) for x in MACS[c].split(':')]) for c in NODES]
 ID_OF = {mac: i for i, mac in enumerate(MAC_OF)}
+ALERT_PAIRS = [sorted([NODES.index(c) for c in s.split('-')]) for s in ALERT_SECTIONS]
 
 FMT_BEACON = '<BBBHI%dbB' % M
 FMT_START = '<BBI'
 FMT_RESET = '<BB'
 FMT_ASSIGN = '<BBB'
+FMT_PASS = '<BBBBHIBbbhh'
 LEN_BEACON = struct.calcsize(FMT_BEACON)
 LEN_START = struct.calcsize(FMT_START)
+LEN_PASS = struct.calcsize(FMT_PASS)
 
 
 def setup_espnow():
@@ -135,6 +145,8 @@ class Station:
         self.last_flush = time.ticks_ms()
         self.sd = None
         self.sd_ok = False
+        self.alert_at = [None] * len(ALERT_SECTIONS)
+        self.pass_seen = []
 
     def send(self, pkt):
         try:
@@ -316,6 +328,32 @@ class Station:
         self.seen.append((now, msg))
         return False
 
+    def on_pass(self, msg):
+        v = struct.unpack(FMT_PASS, msg)
+        if v[0] != MAGIC or v[1] != T_PASS or v[2] >= N or v[3] >= N:
+            return
+        now = time.ticks_ms()
+        while self.pass_seen and time.ticks_diff(now, self.pass_seen[0][0]) >= DEDUP_MS:
+            self.pass_seen.pop(0)
+        for s in self.pass_seen:
+            if s[1] == msg:
+                return
+        self.pass_seen.append((now, msg))
+        pair = sorted([v[2], v[3]])
+        for i, p in enumerate(ALERT_PAIRS):
+            if p == pair:
+                self.alert_at[i] = now
+
+    def alert_text(self):
+        now = time.ticks_ms()
+        out = ''
+        for i, s in enumerate(ALERT_SECTIONS):
+            a = self.alert_at[i]
+            if a is not None and time.ticks_diff(now, a) >= ALERT_MS:
+                self.alert_at[i] = None
+            out += '｜%s %s' % (s, '―' if self.alert_at[i] is None else '害獣を検知')
+        return ' ' + out
+
     def on_recv(self, mac, msg):
         m = bytes(mac)
         sid = ID_OF.get(m)
@@ -323,6 +361,8 @@ class Station:
             return
         msg = bytes(msg)
         origin, kind, v = decode(msg)
+        if len(msg) == LEN_PASS:
+            self.on_pass(msg)
         if self.measuring and kind == 'BEACON' and origin == sid:
             p = self.e.peers_table.get(m)
             if p is not None:
@@ -346,7 +386,7 @@ class Station:
             self.log_row(sid, self.vals)
             if self.measuring or self.holding:
                 return
-            print(' '.join(['%s:%d' % (COLS[i], self.vals[i]) for i in range(N * M)]))
+            print(' '.join(['%s:%d' % (COLS[i], self.vals[i]) for i in range(N * M)]) + self.alert_text())
 
     def need_assign(self):
         if self.other_fwd or self.last_fwd is None:
