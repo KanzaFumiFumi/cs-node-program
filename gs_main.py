@@ -46,7 +46,6 @@ RESULT_HOLD_MS = 5000
 ASSIGN_INTERVAL_MS = 100
 ASSIGN_KEEP_MS = 1000
 FWD_TIMEOUT_MS = 3000
-DEDUP_MS = 1000
 FLUSH_MS = 1000
 JUDGE_MS = 100
 PASS_X_MS = round(PASS_X_S * 1000)
@@ -62,11 +61,9 @@ SD_FREQ = 1000000
 ERR_NODEV = 19
 ERR_NOSPC = 28
 
-MAGIC = 0x52
-T_BEACON = 0x01
-T_START = 0x02
-T_RESET = 0x03
-T_ASSIGN = 0x05
+START_CODE = 0x02
+RESET_CODE = 0xFF
+GW_NONE = 7
 BCAST = b'\xff' * 6
 
 N = len(NODES)
@@ -74,9 +71,9 @@ M = N - 1
 OTHERS = [[j for j in range(N) if j != i] for i in range(N)]
 COLS = ['%s->%s' % (NODES[i], NODES[j]) for i in range(N) for j in OTHERS[i]]
 RAW_NAMES = [c for c in NODES] + ['GS']
-RAW_HEAD = ['time_ms', 'gw', 'gs_rssi', 'type', 'len', 'hex', 'seq', 'node_ms', 'node_gw']
+RAW_HEAD = ['time_ms', 'gw', 'gs_rssi', 'type', 'len', 'hex', 'node_gw']
 RAW_COLS = [RAW_HEAD + COLS[i * M:(i + 1) * M] for i in range(N)] + [RAW_HEAD + ['rssi_%d' % (k + 1) for k in range(M)]]
-EMPTY = [''] * (3 + M)
+EMPTY = [''] * (1 + M)
 MAC_OF = [bytes([int(x, 16) for x in MACS[c].split(':')]) for c in NODES]
 ID_OF = {mac: i for i, mac in enumerate(MAC_OF)}
 ALERT_PAIRS = [sorted([NODES.index(c) for c in s.split('-')]) for s in ALERT_SECTIONS]
@@ -85,12 +82,8 @@ SEC_DIRS = [(i * M + OTHERS[i].index(j), j * M + OTHERS[j].index(i)) for i, j in
 SEC_NAMES = ['%s-%s' % (NODES[i], NODES[j]) for i, j in SECTIONS]
 PASS_HEAD = 'time_s,time_ms,gw,section,rssi_1,base_1,hit_1,rssi_2,base_2,hit_2'
 
-FMT_BEACON = '<BBBHI%dbB' % M
-FMT_START = '<BBI'
-FMT_RESET = '<BB'
-FMT_ASSIGN = '<BBB'
+FMT_BEACON = '<B%db' % M
 LEN_BEACON = struct.calcsize(FMT_BEACON)
-LEN_START = struct.calcsize(FMT_START)
 
 
 def setup_espnow():
@@ -124,20 +117,19 @@ def decode(msg):
     n = len(msg)
     if n == LEN_BEACON:
         v = struct.unpack(FMT_BEACON, msg)
-        if v[0] == MAGIC and v[1] == T_BEACON and v[2] < N:
-            return v[2], 'BEACON', v
-    elif n == LEN_START:
-        v = struct.unpack(FMT_START, msg)
-        if v[0] == MAGIC and v[1] == T_START:
-            return None, 'START', v
+        h = v[0]
+        g = (h >> 2) & 7
+        if not h >> 5 and (g < N or g == GW_NONE):
+            return h & 3, 'BEACON', v
+    elif n == 1 and msg[0] == START_CODE:
+        return None, 'START', None
     return None, '?', None
 
 
 def fields(kind, v):
     if kind == 'BEACON':
-        return [str(v[3]), str(v[4]), NODES[v[5 + M]] if v[5 + M] < N else '-'] + [str(x) for x in v[5:5 + M]]
-    if kind == 'START':
-        return ['', str(v[2]), ''] + [''] * M
+        g = (v[0] >> 2) & 7
+        return [NODES[g] if g < N else '-'] + [str(x) for x in v[1:1 + M]]
     return EMPTY
 
 
@@ -193,7 +185,6 @@ class Station:
         self.counts = [0] * N
         self.latest = [0] * N
         self.vals = [0] * (N * M)
-        self.seen = []
         self.f = None
         self.raw = []
         self.log_t0 = time.ticks_ms()
@@ -217,7 +208,7 @@ class Station:
         cmd = line.strip().lower()
         if cmd == 'r':
             if self.gw is not None:
-                pkt = struct.pack(FMT_RESET, MAGIC, T_RESET)
+                pkt = bytes([RESET_CODE])
                 self.send(pkt)
                 self.start_log(t)
                 self.raw_row(N, '', 'RESET', pkt, EMPTY, t)
@@ -391,16 +382,6 @@ class Station:
         if time.ticks_diff(time.ticks_ms(), self.next_show) > MEASURE_SHOW_MS:
             self.next_show = time.ticks_add(time.ticks_ms(), MEASURE_SHOW_MS)
 
-    def is_dup(self, msg):
-        now = time.ticks_ms()
-        while self.seen and time.ticks_diff(now, self.seen[0][0]) >= DEDUP_MS:
-            self.seen.pop(0)
-        for s in self.seen:
-            if s[1] == msg:
-                return True
-        self.seen.append((now, msg))
-        return False
-
     def judge(self):
         if time.ticks_diff(time.ticks_ms(), self.next_judge) < 0:
             return
@@ -450,8 +431,6 @@ class Station:
             if self.gw is not None and origin is not None and origin != sid:
                 self.other_fwd = True
             return
-        if self.is_dup(msg):
-            return
         if origin is not None and origin != sid:
             self.last_fwd = time.ticks_ms()
         p = self.e.peers_table.get(m)
@@ -459,7 +438,7 @@ class Station:
         if kind == 'BEACON':
             b = origin * M
             for k in range(M):
-                self.vals[b + k] = v[5 + k]
+                self.vals[b + k] = v[1 + k]
             self.log_row(sid, self.vals)
             if self.measuring or self.holding:
                 return
@@ -484,7 +463,7 @@ class Station:
         gap = ASSIGN_INTERVAL_MS if self.need_assign() else ASSIGN_KEEP_MS
         if time.ticks_diff(time.ticks_ms(), self.last_assign) < gap:
             return
-        pkt = struct.pack(FMT_ASSIGN, MAGIC, T_ASSIGN, self.gw)
+        pkt = bytes([self.gw])
         self.send(pkt)
         self.raw_row(N, '', 'ASSIGN', pkt, EMPTY)
         self.other_fwd = False

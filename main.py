@@ -26,11 +26,9 @@ RESET_WINDOW_MS = START_INTERVAL_MS * START_REPEAT
 MIN_FREE_BYTES = 16 * 1024
 LOG_CHECK_ROWS = 10
 
-MAGIC = 0x52
-T_BEACON = 0x01
-T_START = 0x02
-T_RESET = 0x03
-T_ASSIGN = 0x05
+START_CODE = 0x02
+RESET_CODE = 0xFF
+GW_NONE = 7
 BCAST = b'\xff' * 6
 
 N = len(NODES)
@@ -42,14 +40,8 @@ MAC_OF = [bytes([int(x, 16) for x in MACS[c].split(':')]) for c in NODES]
 ID_OF = {mac: i for i, mac in enumerate(MAC_OF)}
 GS_MAC_B = bytes([int(x, 16) for x in GS_MAC.split(':')])
 
-FMT_BEACON = '<BBBHI%dbB' % M
-FMT_START = '<BBI'
-FMT_RESET = '<BB'
-FMT_ASSIGN = '<BBB'
+FMT_BEACON = '<B%db' % M
 LEN_BEACON = struct.calcsize(FMT_BEACON)
-LEN_START = struct.calcsize(FMT_START)
-LEN_RESET = struct.calcsize(FMT_RESET)
-LEN_ASSIGN = struct.calcsize(FMT_ASSIGN)
 
 
 def setup_espnow():
@@ -84,7 +76,6 @@ class Node:
         self.e = e
         self.agg = [0] * (N * M)
         self.t0 = time.ticks_ms()
-        self.seq = 0
         self.started = False
         self.last_reset = self.t0
         self.gw = None
@@ -98,7 +89,6 @@ class Node:
 
     def reset(self):
         self.t0 = time.ticks_ms()
-        self.seq = 0
         self.started = True
         self.last_reset = self.t0
 
@@ -107,8 +97,6 @@ class Node:
             self.e.send(BCAST, pkt, False)
         except OSError:
             pass
-        if self.gw == ME:
-            self.forward(pkt)
 
     def forward(self, pkt):
         try:
@@ -119,7 +107,6 @@ class Node:
     def on_command(self, line):
         if line.strip().lower() == 'r':
             self.t0 = time.ticks_ms()
-            self.seq = 0
             self.start_log()
 
     def start_log(self):
@@ -180,7 +167,7 @@ class Node:
             return
         if time.ticks_diff(time.ticks_ms(), self.next_start) < 0:
             return
-        self.send(struct.pack(FMT_START, MAGIC, T_START, self.now() & 0xFFFFFFFF))
+        self.send(bytes([START_CODE]))
         self.start_left -= 1
         self.next_start = time.ticks_add(self.next_start, START_INTERVAL_MS)
 
@@ -188,14 +175,13 @@ class Node:
         m = bytes(mac)
         n = len(msg)
         if m == GS_MAC_B:
-            if n == LEN_RESET:
-                v = struct.unpack(FMT_RESET, msg)
-                if v[0] == MAGIC and v[1] == T_RESET and self.gw == ME:
-                    self.begin_start_burst()
-            elif n == LEN_ASSIGN:
-                v = struct.unpack(FMT_ASSIGN, msg)
-                if v[0] == MAGIC and v[1] == T_ASSIGN and v[2] < N:
-                    self.set_gw(v[2])
+            if n == 1:
+                c = msg[0]
+                if c == RESET_CODE:
+                    if self.gw == ME:
+                        self.begin_start_burst()
+                elif c < N:
+                    self.set_gw(c)
             return
         sid = ID_OF.get(m)
         if sid is None or sid == ME:
@@ -204,16 +190,17 @@ class Node:
             self.forward(msg)
         if n == LEN_BEACON:
             v = struct.unpack(FMT_BEACON, msg)
-            if v[0] != MAGIC or v[1] != T_BEACON or v[2] != sid:
+            h = v[0]
+            g = (h >> 2) & 7
+            if h >> 5 or (h & 3) != sid or (g >= N and g != GW_NONE):
                 return
             b = sid * M
             for k in range(M):
-                self.agg[b + k] = v[5 + k]
-            if v[5 + M] == sid and self.gw != ME:
+                self.agg[b + k] = v[1 + k]
+            if g == sid and self.gw != ME:
                 self.gw = sid
-        elif n == LEN_START:
-            v = struct.unpack(FMT_START, msg)
-            if v[0] != MAGIC or v[1] != T_START or sid != self.gw:
+        elif n == 1:
+            if msg[0] != START_CODE or sid != self.gw:
                 return
             if self.started and time.ticks_diff(time.ticks_ms(), self.last_reset) < RESET_WINDOW_MS:
                 return
@@ -235,10 +222,9 @@ class Node:
         t = self.now() & 0xFFFFFFFF
         b = ME * M
         own = self.agg[b:b + M]
-        self.send(struct.pack(FMT_BEACON, MAGIC, T_BEACON, ME, self.seq, t, *(own + [0xFF if self.gw is None else self.gw])))
+        self.send(struct.pack(FMT_BEACON, ME | ((GW_NONE if self.gw is None else self.gw) << 2), *own))
         print(' '.join(['%s:%d' % (COLS[i], self.agg[i]) for i in range(N * M)]))
         self.log_row(t)
-        self.seq = (self.seq + 1) & 0xFFFF
 
 
 def main():
