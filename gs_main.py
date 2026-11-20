@@ -18,8 +18,23 @@ MACS = {
 # ---- 害獣検知の表示（ここを書き換える） ----
 # 表示する区間：12個の値の行の後ろに、この順で区間ごとの状態を付ける。
 ALERT_SECTIONS = ['A-B', 'A-C', 'A-D', 'B-C', 'B-D', 'C-D']
-# 表示時間 [ms]：その区間の通過速報を受けてから、この時間「害獣を検知」と表示する。新しい速報を受けたら、そこから数え直す。
+# 表示時間 [ms]：その区間で通過を検知してから、この時間「害獣を検知」と表示する。新しく検知したら、そこから数え直す。
 ALERT_MS = 5000
+
+# ---- 通過の判定の値（実験に合わせてここを書き換える） ----
+# 地上局が0.1秒ごとに、GW 経由で届いた最新の12個の値で、6区間を往復2方向ずつ判定する。
+# 基準値の時間 X [秒]：基準値は、その方向の直前この秒数の RSSI の平均（今の値と未受信の0は含めない）。
+# その方向を最初に受信してからこの秒数たつまでは判定しない。
+PASS_X_S = 10
+# 通過1回の時間 Y [秒]：区間として最初に検知した時刻からこの秒数を通過1回とする。
+# この秒数たった時点でまだ検知していれば、そこから2回目とする。
+PASS_Y_S = 5
+# 下側閾値 [dB]：RSSI ≦ 基準値 − この値 なら反応あり。
+PASS_LO_DB = 2
+# 上側閾値 [dB]：RSSI ≧ 基準値 ＋ この値 なら反応あり。
+PASS_HI_DB = 2
+# 判定ルール：'both' ＝ 2方向とも反応ありで検知、'one' ＝ 2方向のどちらかが反応ありで検知。
+PASS_RULE = 'both'
 
 NODES = 'ABCD'
 CHANNEL = 6
@@ -33,6 +48,9 @@ ASSIGN_KEEP_MS = 1000
 FWD_TIMEOUT_MS = 3000
 DEDUP_MS = 1000
 FLUSH_MS = 1000
+JUDGE_MS = 100
+PASS_X_MS = round(PASS_X_S * 1000)
+PASS_Y_MS = round(PASS_Y_S * 1000)
 
 SD_MOUNT = '/sd'
 SD_SLOT = 2
@@ -49,7 +67,6 @@ T_BEACON = 0x01
 T_START = 0x02
 T_RESET = 0x03
 T_ASSIGN = 0x05
-T_PASS = 0x08
 BCAST = b'\xff' * 6
 
 N = len(NODES)
@@ -63,15 +80,17 @@ EMPTY = [''] * (3 + M)
 MAC_OF = [bytes([int(x, 16) for x in MACS[c].split(':')]) for c in NODES]
 ID_OF = {mac: i for i, mac in enumerate(MAC_OF)}
 ALERT_PAIRS = [sorted([NODES.index(c) for c in s.split('-')]) for s in ALERT_SECTIONS]
+SECTIONS = [(i, j) for i in range(N) for j in range(i + 1, N)]
+SEC_DIRS = [(i * M + OTHERS[i].index(j), j * M + OTHERS[j].index(i)) for i, j in SECTIONS]
+SEC_NAMES = ['%s-%s' % (NODES[i], NODES[j]) for i, j in SECTIONS]
+PASS_HEAD = 'time_s,time_ms,gw,section,rssi_1,base_1,hit_1,rssi_2,base_2,hit_2'
 
 FMT_BEACON = '<BBBHI%dbB' % M
 FMT_START = '<BBI'
 FMT_RESET = '<BB'
 FMT_ASSIGN = '<BBB'
-FMT_PASS = '<BBBBHIBbbhh'
 LEN_BEACON = struct.calcsize(FMT_BEACON)
 LEN_START = struct.calcsize(FMT_START)
-LEN_PASS = struct.calcsize(FMT_PASS)
 
 
 def setup_espnow():
@@ -98,7 +117,7 @@ def err_no(e):
 
 
 def log_names(n):
-    return ['GS_%03d.csv' % n] + ['GS_%03d_%s.csv' % (n, s) for s in RAW_NAMES]
+    return ['GS_%03d.csv' % n] + ['GS_%03d_%s.csv' % (n, s) for s in RAW_NAMES] + ['GS_%03d_PASS.csv' % n]
 
 
 def decode(msg):
@@ -120,6 +139,42 @@ def fields(kind, v):
     if kind == 'START':
         return ['', str(v[2]), ''] + [''] * M
     return EMPTY
+
+
+def base_text(hit, base):
+    return '' if hit is None else '%.1f' % base
+
+
+def hit_text(hit):
+    return '' if hit is None else ('1' if hit else '0')
+
+
+class Ref:
+    def __init__(self):
+        self.ts = []
+        self.vals = []
+        self.total = 0
+        self.first = None
+        self.ready = False
+
+    def judge(self, now, v):
+        while self.ts and time.ticks_diff(now, self.ts[0]) > PASS_X_MS:
+            self.ts.pop(0)
+            self.total -= self.vals.pop(0)
+        if not self.ready and self.first is not None and time.ticks_diff(now, self.first) >= PASS_X_MS:
+            self.ready = True
+        hit = None
+        base = 0
+        if v != 0 and self.ready and self.ts:
+            base = self.total / len(self.ts)
+            hit = v <= base - PASS_LO_DB or v >= base + PASS_HI_DB
+        if v != 0:
+            self.ts.append(now)
+            self.vals.append(v)
+            self.total += v
+            if self.first is None:
+                self.first = now
+        return hit, base
 
 
 class Station:
@@ -146,7 +201,10 @@ class Station:
         self.sd = None
         self.sd_ok = False
         self.alert_at = [None] * len(ALERT_SECTIONS)
-        self.pass_seen = []
+        self.refs = [Ref() for _ in range(N * M)]
+        self.pass_at = [None] * len(SECTIONS)
+        self.next_judge = time.ticks_ms()
+        self.pf = None
 
     def send(self, pkt):
         try:
@@ -223,9 +281,12 @@ class Station:
             for i in range(N + 1):
                 self.raw.append(open('%s/%s' % (SD_MOUNT, files[i + 1]), 'w'))
                 self.raw[i].write(','.join(RAW_COLS[i]) + '\n')
+            self.pf = open('%s/%s' % (SD_MOUNT, files[-1]), 'w')
+            self.pf.write(PASS_HEAD + '\n')
             self.f.flush()
             for g in self.raw:
                 g.flush()
+            self.pf.flush()
         except OSError as e:
             self.log_fail(e)
             return
@@ -253,6 +314,8 @@ class Station:
             self.f.flush()
             for g in self.raw:
                 g.flush()
+            if self.pf is not None:
+                self.pf.flush()
         except OSError as e:
             self.log_fail(e)
 
@@ -271,8 +334,17 @@ class Station:
         hexs = binascii.hexlify(pkt).decode().upper()
         self.write(self.raw[idx], '%d,%s,%s,%s,%d,%s,%s\n' % (time.ticks_diff(at, self.log_t0), gw, rssi, kind, len(pkt), hexs, ','.join(extra)))
 
+    def pass_row(self, now, k, hf, bf, hr, br):
+        if self.pf is None:
+            return
+        f, r = SEC_DIRS[k]
+        t = time.ticks_diff(now, self.log_t0)
+        d = (t + 50) // 100
+        gw = '-' if self.gw is None else NODES[self.gw]
+        self.write(self.pf, '%d.%d,%d,%s,%s,%d,%s,%s,%d,%s,%s\n' % (d // 10, d % 10, t, gw, SEC_NAMES[k], self.vals[f], base_text(hf, bf), hit_text(hf), self.vals[r], base_text(hr, br), hit_text(hr)))
+
     def close_log(self):
-        for g in [self.f] + self.raw:
+        for g in [self.f, self.pf] + self.raw:
             if g is None:
                 continue
             try:
@@ -280,6 +352,7 @@ class Station:
             except OSError:
                 pass
         self.f = None
+        self.pf = None
         self.raw = []
 
     def start_measure(self):
@@ -328,21 +401,27 @@ class Station:
         self.seen.append((now, msg))
         return False
 
-    def on_pass(self, msg):
-        v = struct.unpack(FMT_PASS, msg)
-        if v[0] != MAGIC or v[1] != T_PASS or v[2] >= N or v[3] >= N:
+    def judge(self):
+        if time.ticks_diff(time.ticks_ms(), self.next_judge) < 0:
             return
+        self.next_judge = time.ticks_add(self.next_judge, JUDGE_MS)
+        if time.ticks_diff(time.ticks_ms(), self.next_judge) > JUDGE_MS:
+            self.next_judge = time.ticks_add(time.ticks_ms(), JUDGE_MS)
         now = time.ticks_ms()
-        while self.pass_seen and time.ticks_diff(now, self.pass_seen[0][0]) >= DEDUP_MS:
-            self.pass_seen.pop(0)
-        for s in self.pass_seen:
-            if s[1] == msg:
-                return
-        self.pass_seen.append((now, msg))
-        pair = sorted([v[2], v[3]])
-        for i, p in enumerate(ALERT_PAIRS):
-            if p == pair:
-                self.alert_at[i] = now
+        res = [self.refs[d].judge(now, self.vals[d]) for d in range(N * M)]
+        for k in range(len(SECTIONS)):
+            f, r = SEC_DIRS[k]
+            hf, bf = res[f]
+            hr, br = res[r]
+            if self.pass_at[k] is not None and time.ticks_diff(now, self.pass_at[k]) >= PASS_Y_MS:
+                self.pass_at[k] = None
+            on = (hf or hr) if PASS_RULE == 'one' else (hf and hr)
+            if on and self.pass_at[k] is None:
+                self.pass_at[k] = now
+                for i, p in enumerate(ALERT_PAIRS):
+                    if p == list(SECTIONS[k]):
+                        self.alert_at[i] = now
+                self.pass_row(now, k, hf, bf, hr, br)
 
     def alert_text(self):
         now = time.ticks_ms()
@@ -361,8 +440,6 @@ class Station:
             return
         msg = bytes(msg)
         origin, kind, v = decode(msg)
-        if len(msg) == LEN_PASS:
-            self.on_pass(msg)
         if self.measuring and kind == 'BEACON' and origin == sid:
             p = self.e.peers_table.get(m)
             if p is not None:
@@ -394,6 +471,7 @@ class Station:
         return time.ticks_diff(time.ticks_ms(), self.last_fwd) >= FWD_TIMEOUT_MS
 
     def update(self):
+        self.judge()
         if self.measuring and time.ticks_diff(time.ticks_ms(), self.meas_end) >= 0:
             self.finish_measure()
         if self.measuring:
